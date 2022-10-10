@@ -58,9 +58,19 @@ def auto_get_eth():
         dev = "ens33"
 
 
+def clear_clsact():
+    # delete the original discipline
+    p = os.popen("sudo tc -s qdisc ls dev {}".format(dev))
+    search_obj = re.search(r'clsact', p.read())
+    p.close()
+    if search_obj:
+        os.system("tc filter del dev {} egress".format(dev))
+        os.system("tc qdisc del dev {} clsact".format(dev))
+
+
 def print_skb_event(cpu, data, size):
     global cont_sz, exec_sz, media_sz, rest, sessions, is_docx, dt_model, verbose
-    raw_sz = size - ct.sizeof(ct.c_uint64)
+    raw_sz = size - (ct.sizeof(ct.c_uint32) << 1)
 
     class SkbEvent(ct.Structure):
         _fields_ = [("offset", ct.c_uint32),
@@ -73,7 +83,6 @@ def print_skb_event(cpu, data, size):
     offset = skb_event.offset  # payload offset
     length = skb_event.real_len  # true payload length
     sig, fsz, csz, esz = 0, 0, 0, 0
-    suffix = None
 
     # now we only consider one HTTP intact packet
     if rest:
@@ -100,7 +109,7 @@ def print_skb_event(cpu, data, size):
         def check() -> bool:
             if raw_data[offset + 1] == 67 and raw_data[offset + 2] == 111 and raw_data[offset + 3] == 110 \
                     and raw_data[offset + 4] == 116 and raw_data[offset + 5] == 101 and raw_data[offset + 6] == 110 \
-                    and raw_data[offset + 7] == 116 and raw_data[offset + 8] == 95 and raw_data[offset + 2] == 84:
+                    and raw_data[offset + 7] == 116 and raw_data[offset + 8] == 95 and raw_data[offset + 9] == 84:
                 return True
             else:
                 return False
@@ -109,12 +118,7 @@ def print_skb_event(cpu, data, size):
             is_docx = True
         if verbose:
             print(raw_data[offset: offset + fsz].decode('utf-8'), "({} B)".format(csz))
-        #if fsz >= 5:
-        # suffix = raw_data[offset + fsz - 4: offset + fsz].decode('utf-8').lower()
-        # if suffix == '.bin':
-        #     exec_sz += csz
-        # if suffix == '.jpg' or suffix == '.png' or suffix == '.wmf' or suffix == '.svg' or suffix == 'jpeg':
-        #     media_sz += csz
+
         last = raw_data[offset + fsz - 1]
         last = last + 32 if 65 <= last <= 90 else last
         if last == 110:  # n
@@ -132,37 +136,23 @@ def print_skb_event(cpu, data, size):
     # cope with the whole file
     if sig == SIGNATURE_CENTRAL_DIRECTORY:
         ip_src = int.from_bytes(raw_data[26:30], 'big')
-        ip_dst = int.from_bytes(raw_data[30:34], 'big')
-        port_src = int.from_bytes(raw_data[34:36], 'big')
         port_dst = int.from_bytes(raw_data[36:38], 'big')
-        current_key = sessions.Key(ip_src, ip_dst, port_src, port_dst)
+        current_key = sessions.Key(0, port_dst)
 
         if is_docx:  # only the document info will be printed
-            if verbose:
-                print("[content size: {} B][executive ratio: {}][media ratio: {}]".format(cont_sz, exec_sz / cont_sz,
-                                                                                          media_sz / cont_sz))
-            print("[{}.{}.{}.{}:{} -> {}.{}.{}.{}:{}]".format((ip_src >> 24 & 0xff), (ip_src >> 16 & 0xff),
-                                                              (ip_src >> 8 & 0xff), (ip_src & 0xff), port_src,
-                                                              (ip_dst >> 24 & 0xff), (ip_dst >> 16 & 0xff),
-                                                              (ip_dst >> 8 & 0xff), (ip_dst & 0xff), port_dst))
+            #if verbose:
+            print("[content size: {} B][executive ratio: {}][media ratio: {}]".format(cont_sz, exec_sz / cont_sz,
+                                                                                      media_sz / cont_sz))
+            print("[from: {}.{}.{}.{}][to: local:{}]".format((ip_src >> 24 & 0xff), (ip_src >> 16 & 0xff),
+                                                              (ip_src >> 8 & 0xff), (ip_src & 0xff), port_dst))
             new_row = pd.DataFrame([[cont_sz, exec_sz, media_sz], ], columns=["fsize", "exec_ratio", "media_ratio"],
                                    dtype=float)
-            print("[property: {}]".format("suspicious" if dt_model.predict(new_row) == [1] else "benign"))
+            print("[property: {}]\n".format("suspicious" if dt_model.predict(new_row) == [1] else "benign"))
         # delete this item from the BPF MAP
         if current_key in sessions:
             del sessions[current_key]
         # clear the variables and prepare the next file parsing
         cont_sz, exec_sz, media_sz, rest, is_docx = 0, 0, 0, 0, False
-
-
-def clear_clsact():
-    # delete the original discipline
-    p = os.popen("sudo tc -s qdisc ls dev {}".format(dev))
-    search_obj = re.search(r'clsact', p.read())
-    p.close()
-    if search_obj:
-        os.system("tc filter del dev {} egress".format(dev))
-        os.system("tc qdisc del dev {} clsact".format(dev))
 
 
 dt_model = joblib.load('decision-tree.model')
@@ -171,6 +161,8 @@ parser.add_argument("-v", "--verbose", help="Print the details of the document. 
                                             "cost and is not recommended.", action="store_true")
 parser.add_argument('-i', '--interface', help="Specify a interface you want to monitor, container's veth or ens33 "
                                               "will be the default choice.", default=None)
+parser.add_argument('-p', '--port', help="Specify the server's port you want to monitor, 80 is the default value, "
+                                         "but the server's port may be modified and need you to point ", default="80")
 args = parser.parse_args()
 verbose = args.verbose
 if not args.interface:
@@ -178,7 +170,12 @@ if not args.interface:
 else:
     dev = args.interface
 try:
-    b = BPF(src_file="tc_doc_log.c")
+    txt = None
+    with open("maldocx-scouter.c", "r") as f:
+        txt = f.read()
+    if not txt:
+        exit(-1)
+    b = BPF(text=re.sub(r"PORT", args.port, txt, count=1))
     fn = b.load_func("tc_check_docx", BPF.SCHED_CLS)
     ipr = pyroute2.IPRoute()
     ifd = ipr.link_lookup(ifname=dev)[0]

@@ -17,11 +17,12 @@
 #define ETH_HLEN 14
 #define SIGNATURE_LOCAL_FILE_HEADER   0x04034b50
 
+// for HTTP, a port can be bound with just one socket and represent one session,
+// so, I change the Key with only one member which is the dst_port. But for alignment,
+// I reserve a dummy field for 4B alignment.
 struct Key {
-    u32 src_ip;    //source ip
-    u32 dst_ip;    //destination ip
-    u16 src_port;  //source port
-    u16 dst_port;  //destination port
+    u16 dummy;      //no meaning
+    u16 dst_port;   //destination port
 };
 
 struct Leaf {
@@ -32,7 +33,7 @@ struct Leaf {
 //BPF_TABLE(map_type, key_type, leaf_type, table_name, num_entry)
 //map <Key, Leaf>
 //tracing sessions having same Key(dst_ip, src_ip, dst_port,src_port)
-BPF_HASH(sessions, struct Key, struct Leaf, 1024);
+BPF_HASH(sessions, struct Key, struct Leaf);
 BPF_PERF_OUTPUT(skb_events);
 
 /*
@@ -47,13 +48,14 @@ BPF_PERF_OUTPUT(skb_events);
  */
 int tc_check_docx(struct __sk_buff *skb) {
     // meta data of the socket buffer (16 B)
+    u8 *cursor = 0;
     void *data = (void *)(long)skb->data;
 	void *data_end = (void *)(long)skb->data_end;
 	// essential structures (52 B)
     struct ethhdr *eth = data;
     struct iphdr *iph = data + sizeof(*eth);
     struct tcphdr *tcph = data + sizeof(*eth) + sizeof(*iph);
-    struct Key  key;
+    struct Key  key = {0, 0};
     struct Leaf leaf = {0, 0};
 
     if (data + sizeof(*eth) + sizeof(*iph) + sizeof(*tcph) > data_end)
@@ -62,12 +64,9 @@ int tc_check_docx(struct __sk_buff *skb) {
         return TC_ACT_OK;
     if (iph->protocol != IPPROTO_TCP || iph->ihl != 5)
         return TC_ACT_OK;
-    if (bpf_ntohs(tcph->source) != 80) return TC_ACT_OK;
+    if (bpf_ntohs(tcph->source) != PORT) return TC_ACT_OK;
     // fill the key structure
-    key.dst_ip = bpf_ntohl(iph->daddr);
-    key.src_ip = bpf_ntohl(iph->saddr);
     key.dst_port = bpf_ntohs(tcph->dest);
-    key.src_port = bpf_ntohs(tcph->source);
 
     // to record the payload status (12 B)
     u32 payload_offset = ETH_HLEN + 20 + (tcph->doff << 2);
