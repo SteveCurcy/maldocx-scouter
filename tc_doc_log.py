@@ -60,7 +60,7 @@ def auto_get_eth():
 
 def print_skb_event(cpu, data, size):
     global cont_sz, exec_sz, media_sz, rest, sessions, is_docx, dt_model, verbose
-    raw_sz = size - ct.sizeof(ct.c_uint32)
+    raw_sz = size - ct.sizeof(ct.c_uint64)
 
     class SkbEvent(ct.Structure):
         _fields_ = [("offset", ct.c_uint32),
@@ -70,15 +70,11 @@ def print_skb_event(cpu, data, size):
     # get the Ctype raw data in bytes and get the properties
     skb_event = ct.cast(data, ct.POINTER(SkbEvent)).contents
     raw_data = bytes(bytearray(skb_event.raw))
-    offset = int(skb_event.offset)  # payload offset
-    length = int(skb_event.real_len)  # true payload length
-    ip_src = int.from_bytes(raw_data[26:30], 'big')
-    ip_dst = int.from_bytes(raw_data[30:34], 'big')
-    port_src = int.from_bytes(raw_data[34:36], 'big')
-    port_dst = int.from_bytes(raw_data[36:38], 'big')
+    offset = skb_event.offset  # payload offset
+    length = skb_event.real_len  # true payload length
     sig, fsz, csz, esz = 0, 0, 0, 0
     suffix = None
-    current_key = sessions.Key(ip_src, ip_dst, port_src, port_dst)
+
     # now we only consider one HTTP intact packet
     if rest:
         if length - offset < rest:
@@ -99,17 +95,32 @@ def print_skb_event(cpu, data, size):
 
         # cope with the file name
         cont_sz += csz
+
         # check if this file is document, the DOCX file is a zip file with a file named "[Content_Types].xml"
-        if not is_docx and raw_data[offset: offset + fsz] == b'[Content_Types].xml':
+        def check() -> bool:
+            if raw_data[offset + 1] == 67 and raw_data[offset + 2] == 111 and raw_data[offset + 3] == 110 \
+                    and raw_data[offset + 4] == 116 and raw_data[offset + 5] == 101 and raw_data[offset + 6] == 110 \
+                    and raw_data[offset + 7] == 116 and raw_data[offset + 8] == 95 and raw_data[offset + 2] == 84:
+                return True
+            else:
+                return False
+
+        if not is_docx and fsz == 19 and check():
             is_docx = True
         if verbose:
             print(raw_data[offset: offset + fsz].decode('utf-8'), "({} B)".format(csz))
-        if fsz >= 5:
-            suffix = raw_data[offset + fsz - 4: offset + fsz].decode('utf-8').lower()
-            if suffix == '.bin':
-                exec_sz += csz
-            if suffix == '.jpg' or suffix == '.png' or suffix == '.wmf' or suffix == '.svg' or suffix == 'jpeg':
-                media_sz += csz
+        #if fsz >= 5:
+        # suffix = raw_data[offset + fsz - 4: offset + fsz].decode('utf-8').lower()
+        # if suffix == '.bin':
+        #     exec_sz += csz
+        # if suffix == '.jpg' or suffix == '.png' or suffix == '.wmf' or suffix == '.svg' or suffix == 'jpeg':
+        #     media_sz += csz
+        last = raw_data[offset + fsz - 1]
+        last = last + 32 if 65 <= last <= 90 else last
+        if last == 110:  # n
+            exec_sz += csz
+        elif last == 103 or last == 102:  # g or f
+            media_sz += csz
         offset += fsz
 
         # cope with the last part
@@ -120,6 +131,12 @@ def print_skb_event(cpu, data, size):
 
     # cope with the whole file
     if sig == SIGNATURE_CENTRAL_DIRECTORY:
+        ip_src = int.from_bytes(raw_data[26:30], 'big')
+        ip_dst = int.from_bytes(raw_data[30:34], 'big')
+        port_src = int.from_bytes(raw_data[34:36], 'big')
+        port_dst = int.from_bytes(raw_data[36:38], 'big')
+        current_key = sessions.Key(ip_src, ip_dst, port_src, port_dst)
+
         if is_docx:  # only the document info will be printed
             if verbose:
                 print("[content size: {} B][executive ratio: {}][media ratio: {}]".format(cont_sz, exec_sz / cont_sz,
@@ -148,13 +165,18 @@ def clear_clsact():
         os.system("tc qdisc del dev {} clsact".format(dev))
 
 
-auto_get_eth()
 dt_model = joblib.load('decision-tree.model')
 parser = argparse.ArgumentParser()
 parser.add_argument("-v", "--verbose", help="Print the details of the document. This option will bring a lot of time "
                                             "cost and is not recommended.", action="store_true")
+parser.add_argument('-i', '--interface', help="Specify a interface you want to monitor, container's veth or ens33 "
+                                              "will be the default choice.", default=None)
 args = parser.parse_args()
 verbose = args.verbose
+if not args.interface:
+    auto_get_eth()
+else:
+    dev = args.interface
 try:
     b = BPF(src_file="tc_doc_log.c")
     fn = b.load_func("tc_check_docx", BPF.SCHED_CLS)
@@ -167,7 +189,7 @@ try:
     ipr.tc("add-filter", "bpf", ifd, ":1", fd=fn.fd, name=fn.name,
            parent="ffff:fff2", classid=1, direct_action=True)
 
-    b["skb_events"].open_perf_buffer(print_skb_event)
+    b["skb_events"].open_perf_buffer(print_skb_event, page_cnt=16)
     sessions = b['sessions']
     print("scouter: tc attach to dev [{}].\n".format(dev))
     try:
