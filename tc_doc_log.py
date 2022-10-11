@@ -16,7 +16,7 @@
 #
 # Copyright (c) Steve Curcy
 # October 2022
-# Licensed under the GPL, Version 3.0 (the "License")
+# Licensed under the GPL, Version 2.0 (the "License")
 
 from bcc import BPF
 import ctypes as ct
